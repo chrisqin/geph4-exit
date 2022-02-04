@@ -1,10 +1,14 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use crate::{asn::MY_PUBLIC_IP, config::Config, vpn};
+use event_listener::Event;
 use geph4_binder_transport::{BinderClient, HttpClient};
 
 use dashmap::DashMap;
@@ -36,6 +40,7 @@ pub struct RootCtx {
 
     // pub google_proxy: Option<SocketAddr>,
     pub sess_replacers: DashMap<[u8; 32], Sender<Session>>,
+    pub kill_event: Event,
 }
 
 impl From<Config> for RootCtx {
@@ -65,6 +70,7 @@ impl From<Config> for RootCtx {
                 }
             }
         };
+        log::info!("signing_sk = {}", hex::encode(signing_sk.public));
         let sosistab_sk = x25519_dalek::StaticSecret::from(*signing_sk.secret.as_bytes());
         Self {
             config: cfg.clone(),
@@ -93,11 +99,21 @@ impl From<Config> for RootCtx {
             control_count: Default::default(),
 
             sess_replacers: Default::default(),
+            kill_event: Event::new(),
         }
     }
 }
 
 impl RootCtx {
+    pub fn exit_hostname(&self) -> String {
+        self.config
+            .official()
+            .as_ref()
+            .map(|official| official.exit_hostname().to_owned())
+            .unwrap_or_default()
+            .replace(".", "-")
+    }
+
     fn new_sess(self: &Arc<Self>, sess: sosistab::Session) -> SessCtx {
         SessCtx {
             root: self.clone(),
@@ -197,6 +213,16 @@ async fn idlejitter(ctx: Arc<RootCtx>) {
     }
 }
 
+async fn killconn(ctx: Arc<RootCtx>) {
+    loop {
+        if ctx.conn_count.load(Ordering::Relaxed) > ctx.config.conn_count_limit() {
+            ctx.kill_event
+                .notify_relaxed(ctx.config.conn_count_limit() / 8)
+        }
+        smol::Timer::after(Duration::from_secs(5)).await;
+    }
+}
+
 /// per-session context
 pub struct SessCtx {
     root: Arc<RootCtx>,
@@ -213,7 +239,7 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
         .map(|official| official.exit_hostname().to_owned())
         .unwrap_or_default();
     let _idlejitter = smolscale::spawn(idlejitter(ctx.clone()));
-
+    let _killconn = smolscale::spawn(killconn(ctx.clone()));
     let _vpn = smolscale::spawn(vpn::transparent_proxy_helper(ctx.clone()));
 
     // control protocol listener
@@ -275,7 +301,6 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
         let connkey = format!("conn_count.{}", exit_hostname.replace(".", "-"));
         let ctrlkey = format!("control_count.{}", exit_hostname.replace(".", "-"));
         let taskkey = format!("task_count.{}", exit_hostname.replace(".", "-"));
-        let runtaskkey = format!("run_task_count.{}", exit_hostname.replace(".", "-"));
         let hijackkey = format!("hijackers.{}", exit_hostname.replace(".", "-"));
         let e = epoch::mib().unwrap();
         // let allocated = jemalloc_ctl::stats::allocated::mib().unwrap();
@@ -297,8 +322,6 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                 stat_client.gauge(&ctrlkey, control_count as f64);
                 let task_count = smolscale::active_task_count();
                 stat_client.gauge(&taskkey, task_count as f64);
-                let running_count = smolscale::running_task_count();
-                stat_client.gauge(&runtaskkey, running_count as f64);
                 stat_client.gauge(&hijackkey, ctx.sess_replacers.len() as f64);
             }
             smol::Timer::after(Duration::from_secs(10)).await;

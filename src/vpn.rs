@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use cidr::{Cidr, Ipv4Cidr};
 
 use futures_util::TryFutureExt;
@@ -63,7 +64,7 @@ pub async fn transparent_proxy_helper(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                 };
                 let client = async_dup::Arc::new(client);
                 client.get_ref().set_nodelay(true)?;
-                proxy_loop(ctx, rate_limit, client, addr, false).await
+                proxy_loop(ctx, rate_limit, client, addr.to_string(), false).await
             }
             .map_err(|e| log::trace!("vpn conn closed: {}", e)),
         );
@@ -76,6 +77,7 @@ pub async fn handle_vpn_session(
     ctx: Arc<RootCtx>,
     mux: Arc<sosistab::Multiplex>,
     rate_limit: Arc<RateLimiter>,
+    on_activity: impl Fn(),
 ) -> anyhow::Result<()> {
     if ctx.config.nat_external_iface().is_none() {
         log::warn!("disabling VPN mode since external interface is not specified!");
@@ -119,7 +121,7 @@ pub async fn handle_vpn_session(
                 rate_limit.wait(bts.len()).await;
                 let pkt = Ipv4Packet::new(&bts).expect("don't send me invalid IPv4 packets!");
                 assert_eq!(pkt.get_destination(), addr);
-                let msg = VpnMessage::Payload(bts);
+                let msg = VpnMessage::Payload(Bytes::copy_from_slice(&bts));
                 let mut to_send = BuffMut::new();
                 bincode::serialize_into(to_send.deref_mut(), &msg).unwrap();
                 let _ = mux.send_urel(to_send).await;
@@ -129,6 +131,7 @@ pub async fn handle_vpn_session(
 
     loop {
         let bts = mux.recv_urel().await?;
+        on_activity();
         let msg: VpnMessage = bincode::deserialize(&bts)?;
         match msg {
             VpnMessage::ClientHello { .. } => {
