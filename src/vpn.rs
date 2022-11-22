@@ -1,12 +1,15 @@
+use anyhow::Context;
 use bytes::Bytes;
-use cidr::{Cidr, Ipv4Cidr};
 
+use cidr_utils::cidr::Ipv4Cidr;
 use futures_util::TryFutureExt;
 use libc::{c_void, SOL_IP, SO_ORIGINAL_DST};
 
+use moka::sync::Cache;
+
 use once_cell::sync::Lazy;
 use os_socketaddr::OsSocketAddr;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use pnet_packet::{
     ip::IpNextHeaderProtocols, ipv4::Ipv4Packet, tcp::TcpPacket, udp::UdpPacket, Packet,
 };
@@ -15,16 +18,21 @@ use smol::channel::Sender;
 use sosistab::{Buff, BuffMut};
 
 use geph4_protocol::VpnMessage;
-use std::{collections::BTreeMap, ops::DerefMut, os::unix::io::AsRawFd};
 use std::{
     collections::HashSet,
-    net::{Ipv4Addr, SocketAddr},
-    ops::Deref,
-    sync::Arc,
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::{Deref, DerefMut},
+    os::unix::prelude::{AsRawFd, FromRawFd},
+    sync::{atomic::Ordering, Arc},
 };
-use tundevice::TunDevice;
+use tun::{platform::Device, Device as Device2};
 
-use crate::{connect::proxy_loop, listen::RootCtx, ratelimit::RateLimiter};
+use crate::{
+    connect::proxy_loop,
+    listen::RootCtx,
+    ratelimit::{RateLimiter, STAT_LIMITER, TOTAL_BW_COUNT},
+};
 
 /// Runs the transparent proxy helper
 pub async fn transparent_proxy_helper(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
@@ -42,6 +50,10 @@ pub async fn transparent_proxy_helper(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
         let rate_limit = Arc::new(RateLimiter::unlimited());
         let conn_task = smolscale::spawn(
             async move {
+                static CLIENT_ID_CACHE: Lazy<Cache<IpAddr, u64>> =
+                    Lazy::new(|| Cache::new(1_000_000));
+                let peer_addr = client.as_ref().peer_addr().context("no peer addr")?.ip();
+                let client_id = CLIENT_ID_CACHE.get_with(peer_addr, || rand::thread_rng().gen());
                 let client_fd = client.as_raw_fd();
                 let addr = unsafe {
                     let raw_addr = OsSocketAddr::new();
@@ -63,10 +75,13 @@ pub async fn transparent_proxy_helper(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                     }
                 };
                 let client = async_dup::Arc::new(client);
-                client.get_ref().set_nodelay(true)?;
-                proxy_loop(ctx, rate_limit, client, addr.to_string(), false).await
+                client
+                    .get_ref()
+                    .set_nodelay(true)
+                    .context("cannot set nodelay")?;
+                proxy_loop(ctx, rate_limit, client, client_id, addr.to_string(), false).await
             }
-            .map_err(|e| log::trace!("vpn conn closed: {}", e)),
+            .map_err(|e| log::debug!("vpn conn closed: {:?}", e)),
         );
         conn_task.detach();
     }
@@ -83,15 +98,14 @@ pub async fn handle_vpn_session(
         log::warn!("disabling VPN mode since external interface is not specified!");
         return smol::future::pending().await;
     }
-    Lazy::force(&INCOMING_PKT_HANDLER);
-    log::trace!("handle_vpn_session entered");
+    log::debug!("handle_vpn_session entered");
     scopeguard::defer!(log::trace!("handle_vpn_session exited"));
 
     // set up IP address allocation
     let assigned_ip: Lazy<AssignedIpv4Addr> = Lazy::new(|| IpAddrAssigner::global().assign());
     let addr = assigned_ip.addr();
     scopeguard::defer!({
-        INCOMING_MAP.write().remove(&addr);
+        INCOMING_MAP.invalidate(&addr);
     });
     let stat_key = format!(
         "exit_usage.{}",
@@ -100,12 +114,15 @@ pub async fn handle_vpn_session(
             .as_ref()
             .map(|official| official.exit_hostname().to_string())
             .unwrap_or_default()
-            .replace(".", "-")
+            .replace('.', "-")
     );
 
-    let (send_down, recv_down) =
-        smol::channel::bounded(if rate_limit.is_unlimited() { 4096 } else { 64 });
-    INCOMING_MAP.write().insert(addr, send_down);
+    let (send_down, recv_down) = smol::channel::bounded(if rate_limit.is_unlimited() {
+        65536
+    } else {
+        (rate_limit.limit() / 4) as usize
+    });
+    INCOMING_MAP.insert(addr, send_down);
     let _down_task: smol::Task<anyhow::Result<()>> = {
         let stat_key = stat_key.clone();
         let ctx = ctx.clone();
@@ -114,8 +131,11 @@ pub async fn handle_vpn_session(
             loop {
                 let bts = recv_down.recv().await?;
                 if let Some(stat_client) = ctx.stat_client.as_ref() {
-                    if fastrand::f32() < 0.01 {
-                        stat_client.count(&stat_key, bts.len() as f64 * 100.0)
+                    let n = bts.len();
+                    TOTAL_BW_COUNT.fetch_add(n as u64, Ordering::Relaxed);
+                    if fastrand::f64() < 0.01 && STAT_LIMITER.check().is_ok() {
+                        stat_client
+                            .count(&stat_key, TOTAL_BW_COUNT.swap(0, Ordering::Relaxed) as f64)
                     }
                 }
                 rate_limit.wait(bts.len()).await;
@@ -128,7 +148,7 @@ pub async fn handle_vpn_session(
             }
         })
     };
-
+    let mut stat_count = 0u64;
     loop {
         let bts = mux.recv_urel().await?;
         on_activity();
@@ -147,8 +167,10 @@ pub async fn handle_vpn_session(
             }
             VpnMessage::Payload(bts) => {
                 if let Some(stat_client) = ctx.stat_client.as_ref() {
-                    if fastrand::f32() < 0.01 {
-                        stat_client.count(&stat_key, bts.len() as f64 * 100.0)
+                    stat_count += bts.len() as u64;
+                    if fastrand::f64() < 0.01 && STAT_LIMITER.check().is_ok() {
+                        stat_client.count(&stat_key, stat_count as f64);
+                        stat_count = 0;
                     }
                 }
                 let pkt = Ipv4Packet::new(&bts);
@@ -175,6 +197,12 @@ pub async fn handle_vpn_session(
                         }
                     };
                     if let Some(port) = port {
+                        // Block QUIC due to it performing badly over sosistab etc
+                        if pkt.get_next_level_protocol() == IpNextHeaderProtocols::Udp
+                            && port == 443
+                        {
+                            continue;
+                        }
                         if crate::lists::BLACK_PORTS.contains(&port) {
                             continue;
                         }
@@ -183,7 +211,7 @@ pub async fn handle_vpn_session(
                             continue;
                         }
                     }
-                    RAW_TUN.write_raw(&bts).await;
+                    RAW_TUN_WRITE(&bts);
                 }
             }
             _ => anyhow::bail!("message in invalid context"),
@@ -193,38 +221,54 @@ pub async fn handle_vpn_session(
 
 /// Mapping for incoming packets
 #[allow(clippy::type_complexity)]
-static INCOMING_MAP: Lazy<RwLock<BTreeMap<Ipv4Addr, Sender<Buff>>>> = Lazy::new(Default::default);
-
-/// Incoming packet handler
-static INCOMING_PKT_HANDLER: Lazy<smol::Task<()>> = Lazy::new(|| {
-    smolscale::spawn(async {
-        let mut buf = [0; 2048];
-        loop {
-            let n = RAW_TUN
-                .read_raw(&mut buf)
-                .await
-                .expect("cannot read from tun device");
-            let pkt = &buf[..n];
-            if rand::random::<f32>() < 0.1 {
-                smol::future::yield_now().await;
-            }
-            let map = INCOMING_MAP.read();
-            let dest = Ipv4Packet::new(pkt).map(|pkt| map.get(&pkt.get_destination()));
-            if let Some(Some(dest)) = dest {
-                let _ = dest.try_send(pkt.into());
-            }
-        }
-    })
-});
+static INCOMING_MAP: Lazy<Cache<Ipv4Addr, Sender<Buff>>> =
+    Lazy::new(|| Cache::builder().max_capacity(1_000_000).build());
 
 /// The raw TUN device.
-static RAW_TUN: Lazy<TunDevice> = Lazy::new(|| {
+static RAW_TUN_WRITE: Lazy<Box<dyn Fn(&[u8]) + Send + Sync + 'static>> = Lazy::new(|| {
     log::info!("initializing tun-geph");
-    let dev =
-        TunDevice::new_from_os("tun-geph").expect("could not initiate 'tun-geph' tun device!");
-    dev.assign_ip("100.64.0.1/10");
-    smol::future::block_on(dev.write_raw(b"hello world"));
-    dev
+    let queue_count = std::thread::available_parallelism().unwrap().get();
+    let mut dev = Device::new(
+        tun::Configuration::default()
+            .name("tun-geph")
+            .address("100.64.0.1")
+            .netmask("255.192.0.0")
+            .mtu(1280)
+            .up()
+            .layer(tun::Layer::L3)
+            .queues(queue_count),
+    )
+    .unwrap();
+    // TODO: is this remotely safe??
+    for q in 0..queue_count {
+        let queue = dev.queue(q).unwrap();
+        let queue_fd = queue.as_raw_fd();
+        std::thread::Builder::new()
+            .name("tun-reader".into())
+            .spawn(move || {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(queue_fd) };
+                // great now we can do our magic
+                let mut buf = [0; 2048];
+                loop {
+                    let n = reader.read(&mut buf).expect("cannot read from tun device");
+                    let pkt = &buf[..n];
+                    let dest =
+                        Ipv4Packet::new(pkt).map(|pkt| INCOMING_MAP.get(&pkt.get_destination()));
+                    if let Some(Some(dest)) = dest {
+                        if let Err(err) = dest.try_send(pkt.into()) {
+                            log::trace!("error forwarding packet obtained from tun: {:?}", err);
+                        }
+                    }
+                }
+            })
+            .unwrap();
+    }
+    let dev = Mutex::new(dev);
+    Box::new(move |b| {
+        if let Err(err) = dev.lock().write_all(b) {
+            log::error!("cannot write to TUN: {:?}", err)
+        }
+    })
 });
 
 /// Global IpAddr assigner
@@ -253,8 +297,8 @@ impl IpAddrAssigner {
 
     /// Assigns a new IP address.
     pub fn assign(&self) -> AssignedIpv4Addr {
-        let first = u32::from_be_bytes(self.cidr.first_address().octets());
-        let last = u32::from_be_bytes(self.cidr.last_address().octets());
+        let first = self.cidr.first();
+        let last = self.cidr.last();
         loop {
             let candidate = rand::thread_rng().gen_range(first + 16, last - 16);
             let candidate = Ipv4Addr::from(candidate);

@@ -1,12 +1,11 @@
+use flate2::bufread::GzDecoder;
+use moka::sync::Cache;
+use once_cell::sync::Lazy;
+use rangemap::RangeMap;
 use std::{
     io::BufReader,
     net::{IpAddr, Ipv4Addr},
 };
-
-use cached::proc_macro::cached;
-use flate2::bufread::GzDecoder;
-use once_cell::sync::Lazy;
-use rangemap::RangeMap;
 
 static IPV4_MAP: Lazy<RangeMap<Ipv4Addr, u32>> = Lazy::new(|| {
     use std::io::prelude::*;
@@ -53,10 +52,10 @@ pub fn next_ip(ip: Ipv4Addr) -> Ipv4Addr {
 }
 
 /// Returns the ASN of this IP address, or zero if unable to.
-#[cached(size = 65536)]
 pub fn get_asn(addr: IpAddr) -> u32 {
-    match addr {
+    static ASN_CACHE: Lazy<Cache<IpAddr, u32>> = Lazy::new(|| Cache::new(1_000_000));
+    ASN_CACHE.get_with(addr, || match addr {
         IpAddr::V4(addr) => IPV4_MAP.get(&addr).cloned().unwrap_or_default(),
         _ => 0,
-    }
+    })
 }

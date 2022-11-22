@@ -1,22 +1,26 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
-use crate::{asn::MY_PUBLIC_IP, config::Config, vpn};
+use crate::{asn::MY_PUBLIC_IP, config::Config, ratelimit::STAT_LIMITER, vpn};
 use event_listener::Event;
 use geph4_binder_transport::{BinderClient, HttpClient};
 
 use dashmap::DashMap;
-use jemalloc_ctl::epoch;
+use geph4_protocol::bridge_exit::serve_bridge_exit;
+
 use smol::{channel::Sender, fs::unix::PermissionsExt, prelude::*};
 
 use sosistab::Session;
+use sysinfo::{System, SystemExt};
 use x25519_dalek::StaticSecret;
+
+use self::control::ControlService;
 
 mod control;
 mod session;
@@ -111,7 +115,7 @@ impl RootCtx {
             .as_ref()
             .map(|official| official.exit_hostname().to_owned())
             .unwrap_or_default()
-            .replace(".", "-")
+            .replace('.', "-")
     }
 
     fn new_sess(self: &Arc<Self>, sess: sosistab::Session) -> SessCtx {
@@ -136,20 +140,24 @@ impl RootCtx {
         } else {
             self.sosistab_sk.clone()
         };
+        let stat_count = Arc::new(AtomicU64::new(0));
+        let sc2 = stat_count.clone();
         sosistab::Listener::listen_udp(
             addr,
             long_sk,
             move |len, _| {
                 if let Some(stat) = stat.as_ref() {
-                    if fastrand::f32() < 0.05 {
-                        stat.count(&flow_key, len as f64 * 20.0)
+                    stat_count.fetch_add(len as u64, Ordering::Relaxed);
+                    if fastrand::f64() < 0.01 && STAT_LIMITER.check().is_ok() {
+                        stat.count(&flow_key, stat_count.swap(0, Ordering::Relaxed) as f64)
                     }
                 }
             },
             move |len, _| {
                 if let Some(stat2) = stat2.as_ref() {
-                    if fastrand::f32() < 0.05 {
-                        stat2.count(&fk2, len as f64 * 20.0)
+                    sc2.fetch_add(len as u64, Ordering::Relaxed);
+                    if fastrand::f64() < 0.01 && STAT_LIMITER.check().is_ok() {
+                        stat2.count(&fk2, sc2.swap(0, Ordering::Relaxed) as f64)
                     }
                 }
             },
@@ -202,7 +210,7 @@ async fn idlejitter(ctx: Arc<RootCtx>) {
         let elapsed = start.elapsed();
         if let Some(official) = ctx.config.official() {
             if rand::random::<f32>() < 0.01 {
-                let key = format!("idlejitter.{}", official.exit_hostname().replace(".", "-"));
+                let key = format!("idlejitter.{}", official.exit_hostname().replace('.', "-"));
                 ctx.stat_client
                     .as_ref()
                     .as_ref()
@@ -246,12 +254,23 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
     // future that governs the control protocol
     let control_prot_fut = async {
         if ctx.config.official().is_some() {
-            let control_prot_listen = smol::net::TcpListener::bind("[::0]:28080").await?;
-            loop {
-                let ctx = ctx.clone();
-                let (client, _) = control_prot_listen.accept().await?;
-                smolscale::spawn(control::handle_control(ctx, client)).detach();
-            }
+            let ctx = ctx.clone();
+            let secret = blake3::hash(
+                ctx.config
+                    .official()
+                    .as_ref()
+                    .unwrap()
+                    .bridge_secret()
+                    .as_bytes(),
+            );
+            let socket = smol::net::UdpSocket::bind("0.0.0.0:28080").await?;
+            serve_bridge_exit(
+                socket,
+                *secret.as_bytes(),
+                geph4_protocol::bridge_exit::BridgeExitService(ControlService::new(ctx)),
+            )
+            .await?;
+            Ok(())
         } else {
             smol::future::pending().await
         }
@@ -260,8 +279,8 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
     let bridge_pkt_key = move |bridge_group: &str| {
         format!(
             "raw_flow.{}.{}",
-            exit_hostname2.replace(".", "-"),
-            bridge_group.replace(".", "-")
+            exit_hostname2.replace('.', "-"),
+            bridge_group.replace('.', "-")
         )
     };
     // future that governs the "self bridge"
@@ -295,18 +314,18 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
     };
     // future that uploads gauge statistics
     let gauge_fut = async {
-        let key = format!("session_count.{}", exit_hostname.replace(".", "-"));
-        let rskey = format!("raw_session_count.{}", exit_hostname.replace(".", "-"));
-        let memkey = format!("bytes_allocated.{}", exit_hostname.replace(".", "-"));
-        let connkey = format!("conn_count.{}", exit_hostname.replace(".", "-"));
-        let ctrlkey = format!("control_count.{}", exit_hostname.replace(".", "-"));
-        let taskkey = format!("task_count.{}", exit_hostname.replace(".", "-"));
-        let hijackkey = format!("hijackers.{}", exit_hostname.replace(".", "-"));
-        let e = epoch::mib().unwrap();
-        // let allocated = jemalloc_ctl::stats::allocated::mib().unwrap();
-        let resident = jemalloc_ctl::stats::allocated::mib().unwrap();
+        let key = format!("session_count.{}", exit_hostname.replace('.', "-"));
+        let rskey = format!("raw_session_count.{}", exit_hostname.replace('.', "-"));
+        let memkey = format!("bytes_allocated.{}", exit_hostname.replace('.', "-"));
+        let connkey = format!("conn_count.{}", exit_hostname.replace('.', "-"));
+        let threadkey = format!("thread_key.{}", exit_hostname.replace('.', "-"));
+        let ctrlkey = format!("control_count.{}", exit_hostname.replace('.', "-"));
+        let taskkey = format!("task_count.{}", exit_hostname.replace('.', "-"));
+        let hijackkey = format!("hijackers.{}", exit_hostname.replace('.', "-"));
+        let mut sys = System::new_all();
+
         loop {
-            e.advance().unwrap();
+            sys.refresh_all();
             if let Some(stat_client) = ctx.stat_client.as_ref() {
                 let session_count = ctx.session_count.load(std::sync::atomic::Ordering::Relaxed);
                 stat_client.gauge(&key, session_count as f64);
@@ -314,14 +333,16 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                     .raw_session_count
                     .load(std::sync::atomic::Ordering::Relaxed);
                 stat_client.gauge(&rskey, raw_session_count as f64);
-                let memory_usage = resident.read().unwrap();
+                let memory_usage = sys.total_memory() - sys.available_memory();
                 stat_client.gauge(&memkey, memory_usage as f64);
                 let conn_count = ctx.conn_count.load(std::sync::atomic::Ordering::Relaxed);
                 stat_client.gauge(&connkey, conn_count as f64);
                 let control_count = ctx.control_count.load(std::sync::atomic::Ordering::Relaxed);
                 stat_client.gauge(&ctrlkey, control_count as f64);
                 let task_count = smolscale::active_task_count();
+                let thread_count = smolscale::running_threads();
                 stat_client.gauge(&taskkey, task_count as f64);
+                stat_client.gauge(&threadkey, thread_count as f64);
                 stat_client.gauge(&hijackkey, ctx.sess_replacers.len() as f64);
             }
             smol::Timer::after(Duration::from_secs(10)).await;

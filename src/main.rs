@@ -1,5 +1,6 @@
 use std::{
     io::{Read, Write},
+    net::SocketAddr,
     sync::Arc,
 };
 
@@ -8,8 +9,9 @@ use config::Config;
 use env_logger::Env;
 
 use flate2::{write::GzEncoder, Compression};
-use jemallocator::Jemalloc;
 
+use mimalloc::MiMalloc;
+use smol::process::Command;
 use structopt::StructOpt;
 
 use crate::listen::{main_loop, RootCtx};
@@ -28,11 +30,12 @@ struct Opt {
     /// Path to configuration file. Can be a HTTP URL!
     config: String,
 }
-
 #[global_allocator]
-pub static ALLOCATOR: Jemalloc = Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    std::env::set_var("SOSISTAB_NO_OOB", "1");
+    std::env::set_var("SOSISTAB_UNFAIR_CC", "1");
     if std::env::var("GEPH_SINGLETHREADED").is_ok() {
         smolscale::permanently_single_threaded();
     }
@@ -75,14 +78,48 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(nat_interface) = config.nat_external_iface().as_ref() {
-        config_iptables(nat_interface)?;
+        config_iptables(
+            nat_interface,
+            *config.force_dns(),
+            !config.disable_tcp_termination(),
+        )?;
     }
     let ctx: RootCtx = config.into();
-    smolscale::block_on(main_loop(Arc::new(ctx)))
+    smolscale::block_on(async move {
+        if let Some(range) = ctx.config.random_ipv6_range() {
+            if let Some(iface) = ctx.config.ipv6_interface() {
+                Command::new("ip")
+                    .arg("-6")
+                    .arg("route")
+                    .arg("del")
+                    .arg("local")
+                    .arg(format!("{}", range))
+                    .spawn()?
+                    .output()
+                    .await?;
+                Command::new("ip")
+                    .arg("-6")
+                    .arg("route")
+                    .arg("add")
+                    .arg("local")
+                    .arg(format!("{}", range))
+                    .arg("dev")
+                    .arg(&iface)
+                    .spawn()?
+                    .output()
+                    .await?;
+            }
+        }
+        main_loop(Arc::new(ctx)).await
+    })
 }
 
 /// Configures iptables.
-fn config_iptables(nat_interface: &str) -> anyhow::Result<()> {
+fn config_iptables(
+    nat_interface: &str,
+    force_dns: Option<SocketAddr>,
+    tcp_redirect: bool,
+) -> anyhow::Result<()> {
     let to_run = format!(
         r#"
     #!/bin/sh
@@ -91,14 +128,28 @@ export INTERFACE={}
 iptables --flush
 iptables -t nat -F
 
-iptables -t nat -A PREROUTING -i tun-geph -p tcp --syn -j REDIRECT --match multiport --dports 80,443,8080 --to-ports 10000
+{}
+{}
 
 iptables -t nat -A POSTROUTING -o $INTERFACE -j MASQUERADE --random-fully
 iptables -A FORWARD -i $INTERFACE -o tun-geph -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables -A FORWARD -i tun-geph -o $INTERFACE -j ACCEPT
-iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
 "#,
-        nat_interface
+        nat_interface,
+        if tcp_redirect {
+            "iptables -t nat -A PREROUTING -i tun-geph -p tcp --syn -j REDIRECT --match multiport --dports 80,443,8080 --to-ports 10000"
+        } else {
+            ""
+        },
+        force_dns
+            .map(|d| {
+                format!(
+                    "iptables -t nat -A PREROUTING -p udp --dport 53 -j DNAT --to {}",
+                    d
+                )
+            })
+            .unwrap_or_default()
     );
     let mut cmd = std::process::Command::new("sh")
         .arg("-c")
